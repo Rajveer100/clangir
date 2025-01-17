@@ -16,7 +16,10 @@
 #include "CIRGenCstEmitter.h"
 #include "CIRGenFunction.h"
 #include "CIRGenModule.h"
+#include "CIRGenValue.h"
 #include "TargetInfo.h"
+#include "clang/AST/Expr.h"
+#include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/MissingFeatures.h"
 
 // TODO(cir): we shouldn't need this but we currently reuse intrinsic IDs for
@@ -30,6 +33,7 @@
 #include "clang/Frontend/FrontendDiagnostic.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Value.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -328,6 +332,58 @@ static mlir::Value MakeAtomicCmpXchgValue(CIRGenFunction &cgf,
       cir::MemOrder::SequentiallyConsistent);
 
   return returnBool ? op.getResult(1) : op.getResult(0);
+}
+
+static mlir::Value MakeAtomicFenceValue(CIRGenFunction &cgf,
+                                        const CallExpr *expr,
+                                        cir::MemScopeKind syncScope) {
+  QualType typ = expr->getType();
+  auto &builder = cgf.getBuilder();
+
+  auto intType =
+      expr->getArg(0)->getType()->getPointeeType()->isUnsignedIntegerType()
+          ? builder.getUIntNTy(cgf.getContext().getTypeSize(typ))
+          : builder.getSIntNTy(cgf.getContext().getTypeSize(typ));
+
+  auto orderingVal =
+      emitToInt(cgf, cgf.emitScalarExpr(expr->getArg(1)), typ, intType);
+  auto orderingAttr =
+      orderingVal.getDefiningOp()->getAttrOfType<mlir::IntegerAttr>("value");
+
+  cir::MemOrder ordering;
+  switch (orderingAttr.getInt()) {
+  case 0: {
+    ordering = cir::MemOrder::Relaxed;
+    break;
+  }
+  case 1: {
+    ordering = cir::MemOrder::Consume;
+    break;
+  }
+  case 2: {
+    ordering = cir::MemOrder::Acquire;
+    break;
+  }
+  case 3: {
+    ordering = cir::MemOrder::Release;
+    break;
+  }
+  case 4: {
+    ordering = cir::MemOrder::AcquireRelease;
+    break;
+  }
+  case 5: {
+    ordering = cir::MemOrder::SequentiallyConsistent;
+    break;
+  }
+  default:
+    llvm_unreachable("invalid memory ordering scope");
+  }
+
+  builder.create<cir::AtomicFence>(cgf.getLoc(expr->getSourceRange()),
+                                   syncScope, ordering);
+
+  return mlir::Value();
 }
 
 static bool
@@ -1840,10 +1896,14 @@ RValue CIRGenFunction::emitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     llvm_unreachable("BI__atomic_clear NYI");
 
   case Builtin::BI__atomic_thread_fence:
+    return RValue::get(
+        MakeAtomicFenceValue(*this, E, cir::MemScopeKind::MemScope_System));
   case Builtin::BI__atomic_signal_fence:
+    return RValue::get(MakeAtomicFenceValue(
+        *this, E, cir::MemScopeKind::MemScope_SingleThread));
   case Builtin::BI__c11_atomic_thread_fence:
   case Builtin::BI__c11_atomic_signal_fence:
-    llvm_unreachable("BI__atomic_thread_fence like NYI");
+    llvm_unreachable("BI__c11_atomic_thread_fence like NYI");
 
   case Builtin::BI__builtin_signbit:
   case Builtin::BI__builtin_signbitf:
